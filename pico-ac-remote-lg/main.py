@@ -8,9 +8,9 @@ import gc
 from umqtt.simple import MQTTClient
 
 # --- 0. System Config & Debug ---
-DEBUG = False  # เปลี่ยนเป็น False เมื่อติดตั้งใช้งานจริงเพื่อประหยัดทรัพยากร - True
+DEBUG = True  # เปิด True ไว้ก่อนเพื่อดู Log ตอนทดสอบ ถ้าทุกอย่างนิ่งแล้วค่อยแก้เป็น False ครับ
 SYSNAME = "Eagle Eye Legion"
-SYSVER  = "1.0.3"
+SYSVER  = "1.0.4"  # อัปเกรดเวอร์ชันเพื่อให้ Senko ตรวจพบการเปลี่ยนแปลง
 
 def log(msg):
     if DEBUG:
@@ -32,6 +32,7 @@ CLIENT = None
 MQTT_CONNECTED = False
 LAST_MQTT_RECONNECT = 0
 LAST_DHT_SEND = 0
+LAST_PING = 0  # ตัวแปรใหม่สำหรับคุมจังหวะการส่งสัญญาณชีพ
 
 # --- 3. Functions ---
 
@@ -84,7 +85,8 @@ def send_dht_data():
             SENSOR.measure()
             t, h = SENSOR.temperature(), SENSOR.humidity()
             msg = '{{"t": "{}", "h": "{}"}}'.format(t, h)
-            CLIENT.publish(config.TOPIC_SENSOR_DHT, msg)
+            if CLIENT:
+                CLIENT.publish(config.TOPIC_SENSOR_DHT, msg)
             log(f"[DATA] Sent DHT: {t}C / {h}% (Try {i+1})")
             gc.collect()
             return 
@@ -114,14 +116,15 @@ def on_message(topic, msg):
 
 def try_mqtt_connect():
     global CLIENT, MQTT_CONNECTED
+    log("Connecting to MQTT...")
     try:
-        # --- เพิ่มส่วนนี้: ล้าง Client เก่าก่อนเริ่มใหม่ ---
-        if CLIENT:
+        # --- ล้างข้อมูลเก่าก่อนเริ่มใหม่ (ป้องกันแรมเต็ม) ---
+        if CLIENT is not None:
             try:
                 CLIENT.disconnect()
             except: pass
-        
-        gc.collect() # คืนหน่วยความจำก่อนสร้างก้อนใหม่
+        gc.collect()
+        # -------------------------------------------
         
         CLIENT = MQTTClient(config.CLIENT_ID, config.MQTT_BROKER, keepalive=60)
         CLIENT.set_callback(on_message)
@@ -134,7 +137,7 @@ def try_mqtt_connect():
         
         CLIENT.publish(config.TOPIC_AVAIL, "ONLINE", retain=True, qos=1)
         MQTT_CONNECTED = True
-        log("MQTT Status: Connected")
+        log("MQTT Status: Connected and ONLINE")
         return True
     except Exception as e:
         log(f"MQTT Failed: {e}")
@@ -149,62 +152,55 @@ def is_pressed(pin):
 
 # --- Start Up Sequence ---
 log(f"\n{SYSNAME} v{SYSVER} (Starting...)")
-
-# 1. Power On Flash
 for _ in range(3): LED.on(); utime.sleep(0.05); LED.off(); utime.sleep(0.05)
 
-# 2. WiFi Connecting
 log("Connecting to WiFi...")
 LED.on() 
 if wifi_manager.connect_wifi(config.WIFI_CONFIGS):
     LED.off(); utime.sleep(0.2)
-    for _ in range(2): LED.on(); utime.sleep(0.1); LED.off(); utime.sleep(0.1) # WiFi OK
+    for _ in range(2): LED.on(); utime.sleep(0.1); LED.off(); utime.sleep(0.1)
     
-    # 3. MQTT Connecting
     log(f"Connecting to MQTT Broker {config.MQTT_BROKER}")
     LED.on() 
     if try_mqtt_connect():
         LED.off(); utime.sleep(0.2)
-        LED.on(); utime.sleep(1.5); LED.off() # Ready!
+        LED.on(); utime.sleep(1.5); LED.off()
         log("SYSTEM READY!")
     else:
-        # MQTT Fail: Strobe
         for _ in range(10): LED.on(); utime.sleep(0.05); LED.off(); utime.sleep(0.05)
 else:
-    # WiFi Fail: Slow Flash
     LED.off()
     for _ in range(3): LED.on(); utime.sleep(0.5); LED.off(); utime.sleep(0.5)
 
 # --- Main Loop ---
-LAST_PING = 0 # เพิ่มตัวแปรเก็บเวลา Ping ไว้ด้านบน
-
 while True:
     now = utime.ticks_ms()
     
-    # 1. ตรวจสอบสถานะการเชื่อมต่อ
     if MQTT_CONNECTED:
         try:
             CLIENT.check_msg()
             
-            # ส่ง Ping ทุก 30 วินาที เพื่อไม่ให้ Broker ส่ง Last Will (OFFLINE)
+            # --- ส่ง Ping ทุก 30 วินาที เพื่อรักษาสัญญาณกับ Broker ---
             if utime.ticks_diff(now, LAST_PING) > 30000:
                 CLIENT.ping()
                 LAST_PING = now
+            # ------------------------------------------------
                 
         except Exception as e:
-            log(f"MQTT Connection Lost: {e}")
+            log(f"MQTT Lost Connection: {e}")
             MQTT_CONNECTED = False
             
     elif utime.ticks_diff(now, LAST_MQTT_RECONNECT) > 15000:
-        # ก่อน Reconnect เช็ค WiFi อีกรอบด้วยจะดีมากครับ
+        log("Attempting to Reconnect MQTT...")
         try_mqtt_connect()
         LAST_MQTT_RECONNECT = now
 
-    # 2. การส่งข้อมูล Sensor (เหมือนเดิม)
+    # ส่งข้อมูล DHT ทุก 10 วินาที
     if MQTT_CONNECTED and utime.ticks_diff(now, LAST_DHT_SEND) > 10000:
         send_dht_data()
         LAST_DHT_SEND = now
 
+    # เช็คการกดปุ่มทางกายภาพ
     if is_pressed(BTN_ON):
         send_ir(config.RAW_ON, "ON")
         while BTN_ON.value() == 0: utime.sleep_ms(20)
@@ -218,3 +214,4 @@ while True:
         while BTN_LIGHT.value() == 0: utime.sleep_ms(20)
 
     utime.sleep_ms(20)
+
