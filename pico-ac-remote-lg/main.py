@@ -115,6 +115,14 @@ def on_message(topic, msg):
 def try_mqtt_connect():
     global CLIENT, MQTT_CONNECTED
     try:
+        # --- เพิ่มส่วนนี้: ล้าง Client เก่าก่อนเริ่มใหม่ ---
+        if CLIENT:
+            try:
+                CLIENT.disconnect()
+            except: pass
+        
+        gc.collect() # คืนหน่วยความจำก่อนสร้างก้อนใหม่
+        
         CLIENT = MQTTClient(config.CLIENT_ID, config.MQTT_BROKER, keepalive=60)
         CLIENT.set_callback(on_message)
         CLIENT.set_last_will(config.TOPIC_AVAIL, "OFFLINE", retain=True, qos=1)
@@ -168,18 +176,31 @@ else:
     for _ in range(3): LED.on(); utime.sleep(0.5); LED.off(); utime.sleep(0.5)
 
 # --- Main Loop ---
+LAST_PING = 0 # เพิ่มตัวแปรเก็บเวลา Ping ไว้ด้านบน
+
 while True:
     now = utime.ticks_ms()
     
+    # 1. ตรวจสอบสถานะการเชื่อมต่อ
     if MQTT_CONNECTED:
         try:
             CLIENT.check_msg()
-        except:
+            
+            # ส่ง Ping ทุก 30 วินาที เพื่อไม่ให้ Broker ส่ง Last Will (OFFLINE)
+            if utime.ticks_diff(now, LAST_PING) > 30000:
+                CLIENT.ping()
+                LAST_PING = now
+                
+        except Exception as e:
+            log(f"MQTT Connection Lost: {e}")
             MQTT_CONNECTED = False
+            
     elif utime.ticks_diff(now, LAST_MQTT_RECONNECT) > 15000:
+        # ก่อน Reconnect เช็ค WiFi อีกรอบด้วยจะดีมากครับ
         try_mqtt_connect()
         LAST_MQTT_RECONNECT = now
 
+    # 2. การส่งข้อมูล Sensor (เหมือนเดิม)
     if MQTT_CONNECTED and utime.ticks_diff(now, LAST_DHT_SEND) > 10000:
         send_dht_data()
         LAST_DHT_SEND = now
